@@ -7,7 +7,7 @@ use std::io;
 /// The bytes that it provides should be aligned to the maximum alignment.
 ///
 /// # Safety
-/// After a successful call to [`resize`], [`bytes`](ByteAccess::bytes) and [`bytes_mut`](ByteAccessMut::bytes_mut) must return slices of at least the given length.
+/// After a successful call to [`Self::resize`], [`bytes`](ByteAccess::bytes) and [`bytes_mut`](ByteAccessMut::bytes_mut) must return slices of at least the given length.
 pub unsafe trait BackingStore: ByteAccessMut {
     /// Resize the store to have at least the specified size.
     fn resize(&mut self, len: usize) -> io::Result<()>;
