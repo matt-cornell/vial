@@ -71,7 +71,7 @@ impl FileHeader {
     pub const INIT: Self = Self {
         magic_bytes: *MAGIC_BYTES,
         version: FILE_VERSION,
-        _padding: [0; _],
+        _padding: [0; 2],
         first_free_block: Some(BlockId(NonZeroU32::new(1).unwrap())),
         first_partial_buddy_block: None,
     };
@@ -122,7 +122,7 @@ pub struct SuperblockHeader {
 impl SuperblockHeader {
     pub const NORMAL_EMPTY: Self = Self {
         ty: SuperblockType::NORMAL,
-        _padding: [0; _],
+        _padding: [0; HEADER_SIZE - 1],
         block_usage: empty_block_use(),
     };
     pub const fn using_one(marker: BlockMarker) -> Self {

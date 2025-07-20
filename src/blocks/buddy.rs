@@ -198,7 +198,7 @@ pub fn buddy_alloc<S: BackingStore>(store: &mut S, size: usize) -> io::Result<Id
         };
         *block_header(data).0 = BuddyHeader {
             next,
-            _padding: [0; _],
+            _padding: [0; 12],
             bitset,
         };
         blk.make_id(128)
