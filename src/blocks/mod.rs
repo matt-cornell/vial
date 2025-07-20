@@ -1,19 +1,25 @@
 use crate::backing::*;
-use bytemuck::{AnyBitPattern, NoUninit, Pod, PodInOption, Zeroable, ZeroableInOption};
+use bytemuck::{
+    AnyBitPattern, NoUninit, Pod, PodInOption, TransparentWrapper, Zeroable, ZeroableInOption,
+};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
-use std::ops::{Deref, DerefMut};
+use std::ops::RangeBounds;
 
 pub mod buddy;
 pub mod free;
+pub mod utils;
 
 pub const MAGIC_BYTES: &[u8; 5] = b"\x80vial"; // start with an invalid UTF-8 sequence to try to avoid false positives on text files
 pub const BLOCK_SIZE: usize = 1024;
 pub const SUPERBLOCK_SIZE_BYTES: usize = BLOCK_SIZE * 64;
-pub const VERSION: u8 = 1;
+pub const FILE_VERSION: u8 = 1;
 
+/// Marker byte for the type of a block.
+///
+/// These are stored out of line in superblock headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct BlockMarker(pub u8);
@@ -51,57 +57,49 @@ impl Display for BlockMarker {
     }
 }
 
+/// Header information at the start of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
-pub struct FileHeaderInner {
+pub struct FileHeader {
     pub magic_bytes: [u8; 5],
     pub version: u8,
     pub _padding: [u8; 2],
     pub first_free_block: Option<BlockId>,
     pub first_partial_buddy_block: Option<BlockId>,
 }
-impl FileHeaderInner {
+impl FileHeader {
     pub const INIT: Self = Self {
         magic_bytes: *MAGIC_BYTES,
-        version: VERSION,
-        _padding: [0; 2],
+        version: FILE_VERSION,
+        _padding: [0; _],
         first_free_block: Some(BlockId(NonZeroU32::new(1).unwrap())),
         first_partial_buddy_block: None,
     };
 }
 
+/// Header information for the start of the file, along with the first superblock usage.
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
-pub struct FileHeader {
-    pub inner: FileHeaderInner,
+pub struct FullFileHeader {
+    pub inner: FileHeader,
     pub block_usage: [BlockMarker; 64],
 }
-impl FileHeader {
+impl FullFileHeader {
     pub const INIT: Self = Self {
-        inner: FileHeaderInner::INIT,
+        inner: FileHeader::INIT,
         block_usage: empty_block_use(),
     };
 }
-impl Deref for FileHeader {
-    type Target = FileHeaderInner;
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-impl DerefMut for FileHeader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
+/// The marker byte for a superblock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct SuperblockType(pub u8);
 impl SuperblockType {
-    pub const NORMAL: Self = Self(255);
-    pub const fn is_normal(&self) -> bool {
-        self.0 == 255
+    /// For a non-special block, the marker is `0x80`, the first magic byte.
+    pub const NORMAL: Self = Self(MAGIC_BYTES[0]);
+    pub const fn is_normal(self) -> bool {
+        self.0 == MAGIC_BYTES[0]
     }
 }
 
@@ -111,11 +109,14 @@ const fn empty_block_use() -> [BlockMarker; 64] {
     out
 }
 
+/// The header of a superblock.
+///
+/// This has the same first byte and offset of block markers as a [`FullFileHeader`] to make the first block compatible as a superblock.
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct SuperblockHeader {
     pub ty: SuperblockType,
-    pub _padding: [u8; size_of::<FileHeaderInner>() - 1],
+    pub _padding: [u8; HEADER_SIZE - 1],
     pub block_usage: [BlockMarker; 64],
 }
 impl SuperblockHeader {
@@ -146,100 +147,22 @@ impl Display for BlockId {
     }
 }
 impl BlockId {
-    pub fn in_self(&self, offset: u32) -> io::Result<NonZeroU32> {
-        NonZeroU32::new((self.0.get() * BLOCK_SIZE as u32) | offset).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "Excessively large file (more than 2^32 bytes) can't be indexed",
-            )
-        })
+    /// Get the index of a position offset in this block.
+    pub fn in_self(self, offset: u32) -> io::Result<NonZeroU32> {
+        (self.0.get().checked_mul(BLOCK_SIZE as u32))
+            .map(|o| o | offset)
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "Excessively large file (more than 2^32 bytes) can't be indexed",
+                )
+            })
     }
+    /// Get an [`Id`] for an offset in this block.
     #[inline(always)]
-    pub fn make_id<T>(&self, offset: u32) -> io::Result<Id<T>> {
+    pub fn make_id<T>(self, offset: u32) -> io::Result<Id<T>> {
         self.in_self(offset).map(Id::new)
-    }
-    fn block_type_index(&self) -> io::Result<(usize, usize)> {
-        let i = self.0.get() as usize;
-        let block_start = (i & !0x3f) * BLOCK_SIZE;
-        let offset = (i >> 6).checked_sub(1).ok_or_else(|| {
-            io::Error::other(format!(
-                "Block ID {i} points inside a file or superblock header"
-            ))
-        })?;
-        Ok((block_start, size_of::<FileHeaderInner>() + offset))
-    }
-    /// Get the block type if this block is in a normal superblock, or `None` if it's in a special-use one.
-    #[inline(always)]
-    pub fn block_type(&self, mem: impl ByteAccess) -> io::Result<Option<BlockMarker>> {
-        fn inner(this: BlockId, mem: &[u8]) -> io::Result<Option<BlockMarker>> {
-            let (super_start, offset) = this.block_type_index()?;
-            let v = mem.get(super_start + offset).ok_or_else(|| {
-                io::Error::other(format!(
-                    "Block ID {} is out of range for a file of {} bytes",
-                    this,
-                    mem.len(),
-                ))
-            })?;
-            // already range checked
-            let block_kind = unsafe { SuperblockType(*mem.get_unchecked(super_start)) };
-            Ok(block_kind.is_normal().then_some(BlockMarker(*v)))
-        }
-        inner(*self, mem.bytes())
-    }
-    /// Like [`Self::block_type`], but returns a mutable reference to the block marker.
-    #[inline(always)]
-    pub fn block_type_mut<'a>(
-        &self,
-        mem: &'a mut (impl ByteAccessMut + ?Sized),
-    ) -> io::Result<Option<&'a mut BlockMarker>> {
-        fn inner(this: BlockId, mem: &mut [u8]) -> io::Result<Option<&mut BlockMarker>> {
-            let (super_start, offset) = this.block_type_index()?;
-            let len = mem.len();
-            let mp = mem as *mut [u8] as *mut u8;
-            let v = mem.get_mut(super_start + offset).ok_or_else(|| {
-                io::Error::other(format!(
-                    "Block ID {this} is out of range for a file of {len} bytes"
-                ))
-            })?;
-            // already range checked
-            let block_kind = unsafe { SuperblockType(*mp.add(super_start)) };
-            Ok(block_kind.is_normal().then_some(bytemuck::cast_mut(v)))
-        }
-        inner(*self, mem.bytes_mut())
-    }
-    /// Load the block data and block marker for this block.
-    #[inline(always)]
-    pub fn block_type_and_data<'a>(
-        &self,
-        mem: &'a mut (impl ByteAccessMut + ?Sized),
-    ) -> io::Result<(Option<&'a mut BlockMarker>, &'a mut [u8; BLOCK_SIZE])> {
-        fn inner(
-            this: BlockId,
-            mem: &mut [u8],
-        ) -> io::Result<(Option<&mut BlockMarker>, &mut [u8; BLOCK_SIZE])> {
-            if this.0.get() >> 6 == 0 {
-                return Err(io::Error::other("BlockId points to a superblock header"));
-            }
-            let (super_start, offset) = this.block_type_index()?;
-            let len = mem.len();
-            let mp = mem as *mut [u8] as *mut u8;
-            let start = this.0.get() as usize * BLOCK_SIZE;
-            if start + BLOCK_SIZE >= len {
-                return Err(io::Error::other(format!(
-                    "Block id {this} out of range for storage of {len} bytes",
-                )));
-            }
-            unsafe {
-                let v = &mut *mp.add(super_start).add(offset);
-                let block_kind = SuperblockType(*mp.add(super_start));
-                let data = mp.add(start).cast();
-                Ok((
-                    block_kind.is_normal().then_some(bytemuck::cast_mut(v)),
-                    &mut *data,
-                ))
-            }
-        }
-        inner(*self, mem.bytes_mut())
     }
 }
 
@@ -266,6 +189,9 @@ unsafe impl<T: 'static> NoUninit for Id<T> {}
 unsafe impl<T: 'static> PodInOption for Id<T> {}
 unsafe impl<T> ZeroableInOption for Id<T> {}
 impl<T> Id<T> {
+    /// Create a new ID.
+    ///
+    /// This is entirely transparent, with no validation.
     pub const fn new(index: NonZeroU32) -> Self {
         Self {
             index,
@@ -273,18 +199,20 @@ impl<T> Id<T> {
         }
     }
     /// Change the type of the ID.
+    ///
+    /// This doesn't validate the new alignment.
     pub const fn transmute<U>(self) -> Id<U> {
         Id::new(self.index)
     }
     /// Validate an ID to make sure it points to a valid value.
     ///
     /// This checks alignment, that it points to a nonzero block, that it's in range, and that the value it points to isn't in a (recognized) block's header.
-    pub fn validate(&self, mem: impl BackingStore) -> io::Result<()> {
+    pub fn validate(&self, mem: &(impl WithoutHeader + ?Sized)) -> io::Result<()> {
         fn inner(
             index: NonZeroU32,
             align: usize,
             name: &'static str,
-            mem: &[u8],
+            mem: &NonHeaderBytes,
         ) -> io::Result<()> {
             if !index.get().is_multiple_of(align as u32) {
                 return Err(io::Error::other(format!(
@@ -293,11 +221,11 @@ impl<T> Id<T> {
             }
             let this = Id::<()>::new(index);
             let blk = this.block()?;
-            let Some(marker) = blk.block_type(mem)? else {
+            let Some(marker) = utils::block_type(blk, mem)? else {
                 return Ok(());
             };
             match marker {
-                BlockMarker::FREE => {
+                BlockMarker::UNINIT | BlockMarker::FREE => {
                     return Err(io::Error::other(format!(
                         "ID {index} points into a free block"
                     )));
@@ -317,7 +245,7 @@ impl<T> Id<T> {
             self.index,
             align_of::<T>(),
             std::any::type_name::<T>(),
-            mem.bytes(),
+            mem.guard(),
         )
     }
     /// Get the owning block for this ID. There should never be IDs pointing to block 0, but that's a valid layout, so this method is fallible.
@@ -327,6 +255,7 @@ impl<T> Id<T> {
             .map(BlockId)
             .ok_or_else(|| io::Error::other(format!("ID {} belongs to block 0", self.index)))
     }
+    /// Offset of this position within a block.
     pub fn offset(&self) -> u32 {
         self.index.get() % BLOCK_SIZE as u32
     }
@@ -335,61 +264,194 @@ impl<T> Id<T> {
 /// Load the header of a file, or create one if the store is empty.
 ///
 /// This returns errors if the operation fails or the header is invalid.
-pub fn file_header(store: &mut impl BackingStore) -> io::Result<&mut FileHeader> {
+pub fn check_file_header(store: &mut impl BackingStore) -> io::Result<()> {
     if store.bytes_mut().is_empty() {
         store.resize(SUPERBLOCK_SIZE_BYTES)?;
-        let header = bytemuck::from_bytes_mut(&mut store.bytes_mut()[..size_of::<FileHeader>()]);
-        *header = FileHeader::INIT;
-        return Ok(header);
+        let bytes = store.bytes_mut();
+        bytes[..size_of::<FullFileHeader>()]
+            .copy_from_slice(bytemuck::bytes_of(&FullFileHeader::INIT));
+        return Ok(());
     }
-    let header: &mut FileHeader = bytemuck::from_bytes_mut(
-        store
-            .bytes_mut()
-            .get_mut(..size_of::<FileHeader>())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Input data is too small for a file header",
-                )
-            })?,
-    );
+    let head = store.bytes_mut().get_mut(..HEADER_SIZE).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Input data is too small for a file header",
+        )
+    })?;
+    let header = bytemuck::from_bytes_mut::<FileHeader>(head);
     if header.magic_bytes != *MAGIC_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Magic bytes don't match",
         ));
     }
-    if header.version > VERSION {
+    if header.version > FILE_VERSION {
         return Err(io::Error::other(format!(
             "File version is {}, but this build of Vial only expects up to {}",
-            header.version, VERSION
+            header.version, FILE_VERSION
         )));
     }
-    Ok(header)
+    Ok(())
 }
 
+/// Load the file header and remainder of the file.
+///
+/// This doesn't do any validation on the file, only
+pub fn file_header(
+    store: &mut (impl ByteAccessMut + ?Sized),
+) -> io::Result<(&mut FileHeader, &mut NonHeaderBytes)> {
+    let (head, rest) = NonHeaderBytes::split_mut(store.bytes_mut()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Input data is too small for a file header",
+        )
+    })?;
+    let header = bytemuck::from_bytes_mut::<FileHeader>(head);
+    Ok((header, rest))
+}
+
+/// Load the block header of a given type, and return the rest of the block.
+#[inline(always)]
 pub fn block_header<T: NoUninit + AnyBitPattern>(data: &mut [u8]) -> (&mut T, &mut [u8]) {
     let (head, tail) = data.split_at_mut(size_of::<T>());
     (bytemuck::from_bytes_mut(head), tail)
 }
 
-/// Load the data in a block.
+/// A trait that allows for a guard against the first `size_of::<FileHeader>()` bytes of the file.
 ///
-/// This can only fail if the block ID is out of range.
-pub fn load_block(
-    store: &mut (impl ByteAccessMut + ?Sized),
-    id: BlockId,
-) -> io::Result<&mut [u8; BLOCK_SIZE]> {
-    let start = id.0.get() as usize * BLOCK_SIZE;
-    let end = start + BLOCK_SIZE;
-    let len = store.bytes().len();
-    store
-        .bytes_mut()
-        .get_mut(start..end)
-        .map(bytemuck::from_bytes_mut)
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "Block id {id} out of range for storage of {len} bytes",
-            ))
-        })
+/// This is implemented for all [`ByteAccessMut`], along with [`NonHeaderBytes`].
+pub trait WithoutHeader {
+    /// Get the rest of the file as a slice.
+    fn borrow(&self) -> &[u8];
+    /// Get the rest of the file as a mutable slice.
+    fn borrow_mut(&mut self) -> &mut [u8];
+    /// Get a [`NonHeaderBytes`] reference, erasing the type.
+    #[inline(always)]
+    fn guard(&self) -> &NonHeaderBytes {
+        NonHeaderBytes::wrap_ref(self.borrow())
+    }
+    /// Get a mutable [`NonHeaderBytes`] reference, erasing the type.
+    #[inline(always)]
+    fn guard_mut(&mut self) -> &mut NonHeaderBytes {
+        NonHeaderBytes::wrap_mut(self.borrow_mut())
+    }
 }
+
+const HEADER_SIZE: usize = size_of::<FileHeader>();
+
+/// An implementation of [`WithoutHeader`] that's already guarded against.
+#[derive(TransparentWrapper)]
+#[repr(transparent)]
+pub struct NonHeaderBytes([u8]);
+impl NonHeaderBytes {
+    /// Split the first `size_of::<FileHeader>()` bytes off from a slice, returning that and the rest of the file as a guard.
+    pub fn split(data: &[u8]) -> Option<(&[u8; HEADER_SIZE], &Self)> {
+        data.split_first_chunk()
+            .map(|(h, t)| (h, Self::wrap_ref(t)))
+    }
+    /// Split the first `size_of::<FileHeader>()` bytes off from a mutable slice, returning that and the rest of the file as a guard.
+    pub fn split_mut(data: &mut [u8]) -> Option<(&mut [u8; HEADER_SIZE], &mut Self)> {
+        data.split_first_chunk_mut()
+            .map(|(h, t)| (h, Self::wrap_mut(t)))
+    }
+}
+impl WithoutHeader for NonHeaderBytes {
+    #[inline(always)]
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+    #[inline(always)]
+    fn borrow_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+impl<T: ByteAccessMut + ?Sized> WithoutHeader for T {
+    #[inline(always)]
+    fn borrow(&self) -> &[u8] {
+        self.bytes().get(HEADER_SIZE..).unwrap_or(&[])
+    }
+    #[inline(always)]
+    fn borrow_mut(&mut self) -> &mut [u8] {
+        self.bytes_mut().get_mut(HEADER_SIZE..).unwrap_or(&mut [])
+    }
+}
+
+/// Extension methods for [`WithoutHeader`] types that mimic the API of `[u8]`.
+///
+/// Out of laziness, the `get*` family of functions have been split into `get_index*` and `get_range*`.
+#[allow(clippy::missing_safety_doc)]
+pub trait WithoutHeaderExt: WithoutHeader {
+    #[inline(always)]
+    fn as_ptr(&self) -> *const u8 {
+        self.borrow().as_ptr().wrapping_sub(HEADER_SIZE)
+    }
+    #[inline(always)]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.borrow_mut().as_mut_ptr().wrapping_sub(HEADER_SIZE)
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.borrow().len() + HEADER_SIZE
+    }
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    #[inline(always)]
+    fn get_index(&self, index: usize) -> Option<&u8> {
+        self.borrow().get(index + HEADER_SIZE)
+    }
+    #[inline(always)]
+    fn get_range(&self, range: impl RangeBounds<usize>) -> Option<&[u8]> {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        self.borrow().get((
+            start.map(|b| *b + HEADER_SIZE),
+            end.map(|b| *b + HEADER_SIZE),
+        ))
+    }
+    #[inline(always)]
+    unsafe fn get_index_unchecked(&self, index: usize) -> &u8 {
+        unsafe { self.borrow().get_unchecked(index + HEADER_SIZE) }
+    }
+    #[inline(always)]
+    unsafe fn get_range_unchecked(&self, range: impl RangeBounds<usize>) -> &[u8] {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        unsafe {
+            self.borrow().get_unchecked((
+                start.map(|b| *b + HEADER_SIZE),
+                end.map(|b| *b + HEADER_SIZE),
+            ))
+        }
+    }
+    #[inline(always)]
+    fn get_index_mut(&mut self, index: usize) -> Option<&mut u8> {
+        self.borrow_mut().get_mut(index + HEADER_SIZE)
+    }
+    #[inline(always)]
+    fn get_range_mut(&mut self, range: impl RangeBounds<usize>) -> Option<&mut [u8]> {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        self.borrow_mut().get_mut((
+            start.map(|b| *b + HEADER_SIZE),
+            end.map(|b| *b + HEADER_SIZE),
+        ))
+    }
+    #[inline(always)]
+    unsafe fn get_index_unchecked_mut(&mut self, index: usize) -> &mut u8 {
+        unsafe { self.borrow_mut().get_unchecked_mut(index + HEADER_SIZE) }
+    }
+    #[inline(always)]
+    unsafe fn get_range_unchecked_mut(&mut self, range: impl RangeBounds<usize>) -> &mut [u8] {
+        let start = range.start_bound();
+        let end = range.end_bound();
+        unsafe {
+            self.borrow_mut().get_unchecked_mut((
+                start.map(|b| *b + HEADER_SIZE),
+                end.map(|b| *b + HEADER_SIZE),
+            ))
+        }
+    }
+}
+impl<T: WithoutHeader + ?Sized> WithoutHeaderExt for T {}

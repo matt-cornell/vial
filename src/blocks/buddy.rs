@@ -36,7 +36,7 @@ const BITMASKS: [u128; 7] = [
 /// require a power-of-two sized space to be free, but don't claim all of the space.
 ///
 /// This will fail for zero-sized allocations and allocations of more than 896 (7 × 128) bytes.
-pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<()>> {
+pub fn buddy_alloc<S: BackingStore>(store: &mut S, size: usize) -> io::Result<Id<()>> {
     if size == 0 {
         return Err(io::Error::other(
             "Attempted to buddy-allocate a zero-sized value",
@@ -47,30 +47,27 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
             "Can't allocate more that 896 bytes through buddy allocation ({size} requested)"
         )));
     }
-    let header = file_header(store)?;
+    let (header, rest) = file_header(store)?;
     let mut last = None;
     let mut block = header.first_partial_buddy_block;
-    let header = header as *mut FileHeader;
     let mut ret = None;
     while let Some(blk) = block {
         let mut remove_block = true;
-        let data = load_block(store, blk)?;
+        let data = utils::block_data_mut(blk, rest)?;
         let (blk_header, _) = block_header::<BuddyHeader>(data);
         if blk_header.bitset.iter().all(|i| *i == 0) {
             let next = blk_header.next;
-            unsafe {
-                let next_free = (&mut *header).first_free_block.replace(blk);
-                *block_header::<free::FreeBlock>(data).0 = free::FreeBlock { next_free };
-                *blk.block_type_mut(store.bytes_mut())?.ok_or_else(|| {
-                    io::Error::other("Buddy block (being freed) is in a special superblock")
-                })? = BlockMarker::FREE;
-            }
+            let next_free = header.first_free_block.replace(blk);
+            *block_header::<free::FreeBlock>(data).0 = free::FreeBlock { next_free };
+            *utils::block_type_mut(blk, rest)?.ok_or_else(|| {
+                io::Error::other("Buddy block (being freed) is in a special superblock")
+            })? = BlockMarker::FREE;
             if let Some(last) = last {
-                block_header::<BuddyHeader>(load_block(store, last)?).0.next = next;
+                block_header::<BuddyHeader>(utils::block_data_mut(last, rest)?)
+                    .0
+                    .next = next;
             } else {
-                unsafe {
-                    (&mut *header).first_partial_buddy_block = next;
-                }
+                header.first_partial_buddy_block = next;
             }
             block = next;
             continue;
@@ -169,11 +166,11 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
                             "Self-referential block, this should never happen naturally!",
                         ));
                     }
-                    block_header::<BuddyHeader>(load_block(store, prev)?).0.next = next;
+                    block_header::<BuddyHeader>(utils::block_data_mut(prev, rest)?)
+                        .0
+                        .next = next;
                 } else {
-                    unsafe {
-                        (&mut *header).first_partial_buddy_block = next;
-                    }
+                    header.first_partial_buddy_block = next;
                 }
             }
             break;
@@ -181,6 +178,7 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
         last = std::mem::replace(&mut block, blk_header.next);
     }
     ret.ok_or(()).or_else(|_| {
+        let sp = store as *mut S;
         let (blk, data) = free::alloc_block(store, BlockMarker::BUDDY)?;
         let mut bitset = [0; 7];
         let mut size = size;
@@ -192,7 +190,12 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
                 *i = (1 << size) - 1;
             }
         }
-        let next = unsafe { (&mut *header).first_partial_buddy_block.replace(blk) };
+        let next = unsafe {
+            file_header(&mut *sp)?
+                .0
+                .first_partial_buddy_block
+                .replace(blk)
+        };
         *block_header(data).0 = BuddyHeader {
             next,
             _padding: [0; _],
@@ -227,7 +230,14 @@ pub fn buddy_free(store: &mut impl BackingStore, id: Id<()>, len: usize) -> io::
         )));
     }
     let blk = id.block()?;
-    let (marker, data) = blk.block_type_and_data(store)?;
+    let bytes = store.bytes_mut();
+    let Some((header_data, rest)) = NonHeaderBytes::split_mut(bytes) else {
+        return Err(io::Error::other(format!(
+            "Block id {blk} out of range for storage of {} bytes",
+            bytes.len(),
+        )));
+    };
+    let (marker, data) = utils::block_type_and_data(blk, rest)?;
     match marker.copied() {
         None => return Err(io::Error::other("Buddy block is in a special superblock")),
         Some(BlockMarker::BUDDY) => {}
@@ -252,8 +262,7 @@ pub fn buddy_free(store: &mut impl BackingStore, id: Id<()>, len: usize) -> io::
         header.bitset[(start_idx + 1)..end_idx].fill(0);
     }
     if was_full {
-        let header = unsafe { &mut *(header as *mut BuddyHeader) };
-        let file = unsafe { &mut *(file_header(store)? as *mut FileHeader) };
+        let file = bytemuck::from_bytes_mut::<FileHeader>(header_data);
         header.next = file.first_partial_buddy_block.replace(blk);
     }
     Ok(())
