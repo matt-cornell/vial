@@ -10,7 +10,10 @@ pub struct FreeBlock {
 /// Allocate a block, reusing one from the free list if possible.
 ///
 /// The contents of this block's memory could have anything in them,
-pub fn alloc_block(store: &mut impl BackingStore) -> io::Result<(BlockId, &mut [u8; BLOCK_SIZE])> {
+pub fn alloc_block(
+    store: &mut impl BackingStore,
+    new_marker: BlockMarker,
+) -> io::Result<(BlockId, &mut [u8; BLOCK_SIZE])> {
     let header = file_header(store)?;
     let hptr = header as *mut FileHeader;
     if let Some(block_id) = header.first_free_block {
@@ -43,7 +46,7 @@ pub fn alloc_block(store: &mut impl BackingStore) -> io::Result<(BlockId, &mut [
                 )));
             }
         };
-        *marker = BlockMarker::MISC_USE;
+        *marker = new_marker;
         Ok((block_id, block))
     } else {
         let len = store.bytes().len();
@@ -65,7 +68,7 @@ pub fn alloc_block(store: &mut impl BackingStore) -> io::Result<(BlockId, &mut [
         let mem = store.bytes_mut();
         unsafe {
             std::ptr::copy_nonoverlapping(
-                &SuperblockHeader::USING_ONE as *const _ as *const u8,
+                &SuperblockHeader::using_one(new_marker) as *const _ as *const u8,
                 mem.as_mut_ptr().add(len),
                 size_of::<SuperblockHeader>(),
             );

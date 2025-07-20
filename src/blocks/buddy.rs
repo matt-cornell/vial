@@ -4,9 +4,8 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct BuddyHeader {
-    pub marker: BlockMarker,
-    pub _padding: [u8; 11],
     pub next: Option<BlockId>,
+    pub _padding: [u8; 12],
     pub bitset: [u128; 7],
 }
 
@@ -63,7 +62,7 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
                 let next_free = (&mut *header).first_free_block.replace(blk);
                 *block_header::<free::FreeBlock>(data).0 = free::FreeBlock { next_free };
                 *blk.block_type_mut(store.bytes_mut())?.ok_or_else(|| {
-                    io::Error::other("Buddy block (being freed) is in a special-use superblock!")
+                    io::Error::other("Buddy block (being freed) is in a special superblock")
                 })? = BlockMarker::FREE;
             }
             if let Some(last) = last {
@@ -182,7 +181,7 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
         last = std::mem::replace(&mut block, blk_header.next);
     }
     ret.ok_or(()).or_else(|_| {
-        let (blk, data) = free::alloc_block(store)?;
+        let (blk, data) = free::alloc_block(store, BlockMarker::BUDDY)?;
         let mut bitset = [0; 7];
         let mut size = size;
         for i in &mut bitset {
@@ -195,9 +194,8 @@ pub fn buddy_alloc(store: &mut impl BackingStore, size: usize) -> io::Result<Id<
         }
         let next = unsafe { (&mut *header).first_partial_buddy_block.replace(blk) };
         *block_header(data).0 = BuddyHeader {
-            marker: BlockMarker::BUDDY,
-            _padding: [0; 11],
             next,
+            _padding: [0; _],
             bitset,
         };
         blk.make_id(128)
@@ -229,13 +227,17 @@ pub fn buddy_free(store: &mut impl BackingStore, id: Id<()>, len: usize) -> io::
         )));
     }
     let blk = id.block()?;
-    let data = load_block(store, blk)?;
-    let (header, _) = block_header::<BuddyHeader>(data);
-    if header.marker != BlockMarker::BUDDY {
-        return Err(io::Error::other(
-            "Attempted to free data in a non-buddy block",
-        ));
+    let (marker, data) = blk.block_type_and_data(store)?;
+    match marker.copied() {
+        None => return Err(io::Error::other("Buddy block is in a special superblock")),
+        Some(BlockMarker::BUDDY) => {}
+        Some(marker) => {
+            return Err(io::Error::other(format!(
+                "Unexpected block marker {marker}"
+            )));
+        }
     }
+    let (header, _) = block_header::<BuddyHeader>(data);
     let was_full = header.bitset.iter().all(|i| *i == u128::MAX); // this could probably be optimized 
     let end = off + len;
     let start_idx = (off >> 7) - 1;

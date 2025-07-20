@@ -110,11 +110,6 @@ const fn empty_block_use() -> [BlockMarker; 64] {
     out[0] = BlockMarker::RESERVED;
     out
 }
-const fn using_one() -> [BlockMarker; 64] {
-    let mut out = empty_block_use();
-    out[1] = BlockMarker::MISC_USE;
-    out
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
@@ -129,11 +124,11 @@ impl SuperblockHeader {
         _padding: [0; _],
         block_usage: empty_block_use(),
     };
-    pub const USING_ONE: Self = Self {
-        ty: SuperblockType::NORMAL,
-        _padding: [0; _],
-        block_usage: using_one(),
-    };
+    pub const fn using_one(marker: BlockMarker) -> Self {
+        let mut this = Self::NORMAL_EMPTY;
+        this.block_usage[1] = marker;
+        this
+    }
 }
 
 /// A type-safe block ID.
